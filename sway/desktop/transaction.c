@@ -4,6 +4,7 @@
 #include <time.h>
 #include <wlr/types/wlr_buffer.h>
 #include "scenefx/types/fx/clipped_region.h"
+#include "sway/animation_manager.h"
 #include "sway/config.h"
 #include "sway/scene_descriptor.h"
 #include "sway/desktop/idle_inhibit_v1.h"
@@ -72,6 +73,7 @@ static void transaction_destroy(struct sway_transaction *transaction) {
 				workspace_destroy(node->sway_workspace);
 				break;
 			case N_CONTAINER:
+				// TODO: perhaps handle close animation here!
 				container_destroy(node->sway_container);
 				break;
 			}
@@ -406,6 +408,28 @@ static void arrange_container(struct sway_container *con,
 	// make sure it's enabled for viewing
 	wlr_scene_node_set_enabled(&con->scene_tree->node, true);
 
+	if (con->view) {
+		// reuse the position from arrange_child. A bit hacky, but this reduces diff size vs upstream.
+		int x = get_animated_value(con->scene_tree->node.x + con->animation_state.delta_x,
+			con->scene_tree->node.x, *con->animation_state.animation);
+		int y = get_animated_value(con->scene_tree->node.y + con->animation_state.delta_y,
+			con->scene_tree->node.y, *con->animation_state.animation);
+		wlr_scene_node_set_position(&con->scene_tree->node, x, y);
+
+		width = get_animated_value(width + con->animation_state.delta_width, width,
+			*con->animation_state.animation);
+		if (width <= 0) {
+			return;
+		}
+		height = get_animated_value(height + con->animation_state.delta_height, height,
+			*con->animation_state.animation);
+		if (height <= 0) {
+			return;
+		}
+	}
+	con->animation_state.current_width = width;
+	con->animation_state.current_height = height;
+
 	if (con->output_handler) {
 		wlr_scene_buffer_set_dest_size(con->output_handler, width, height);
 	}
@@ -438,10 +462,6 @@ static void arrange_container(struct sway_container *con,
 			}
 		});
 
-		bool is_urgent = con->view && view_is_urgent(con->view);
-		float* shadow_color = is_urgent || con->current.focused ?
-				config->shadow_color : config->shadow_inactive_color;
-		wlr_scene_shadow_set_color(con->shadow, shadow_color);
 		wlr_scene_shadow_set_blur_sigma(con->shadow, config->shadow_blur_sigma);
 		wlr_scene_shadow_set_corner_radius(con->shadow,
 				!has_corner_radius ? 0 : corner_radius);
@@ -538,11 +558,32 @@ static void arrange_container(struct sway_container *con,
 		wlr_scene_node_set_position(&con->border.right->node,
 			width - border_right, border_top + vert_border_offset);
 
+		int content_width = width - border_left - border_right;
+		int content_height = height - border_top - border_bottom;
+
+		// only make sure to clip the content if there is content to clip
+		if (!wl_list_empty(&con->view->content_tree->children)) {
+			struct wlr_box clip = (struct wlr_box){
+				.x = con->view->geometry.x,
+				.y = con->view->geometry.y,
+				.width = content_width,
+				.height = content_height,
+			};
+			wlr_scene_subsurface_tree_set_clip(&con->view->content_tree->node, &clip);
+		}
+		con->animation_state.current_content_width = content_width;
+		if (content_width <= 0) {
+			return;
+		}
+		con->animation_state.current_content_height = content_height;
+		if (content_height <= 0) {
+			return;
+		}
+
 		// Dim
 		if (con->dim_rect) {
 			wlr_scene_node_set_position(&con->dim_rect->node, border_left, border_top);
-			wlr_scene_rect_set_size(con->dim_rect, con->current.content_width,
-					con->current.content_height);
+			wlr_scene_rect_set_size(con->dim_rect, content_width, content_height);
 			bool has_titlebar = !title_bar || con->current.border == B_NORMAL;
 			wlr_scene_rect_set_corner_radii(
 				con->dim_rect,
@@ -558,8 +599,7 @@ static void arrange_container(struct sway_container *con,
 
 		wlr_scene_node_set_enabled(&con->blur->node, con->blur_enabled);
 		wlr_scene_node_set_position(&con->blur->node, border_left, border_top);
-		wlr_scene_blur_set_size(con->blur, con->current.content_width,
-			con->current.content_height);
+		wlr_scene_blur_set_size(con->blur, content_width, content_height);
 	} else {
 		// make sure to disable the title bar if the parent is not managing it
 		if (title_bar) {
@@ -823,6 +863,20 @@ static void arrange_root(struct sway_root *root) {
 	arrange_popups(root->layers.popup);
 }
 
+void animation_update_callback() {
+	// if there's a pending transaction there will be a re-arrange anyway
+	if (!server.pending_transaction) {
+		arrange_root(root);
+	}
+}
+
+static bool should_con_new_animation(struct sway_container *con, struct sway_container_state *new_state) {
+	return con->current.width != new_state->width ||
+		con->current.height != new_state->height ||
+		con->current.x != new_state->x ||
+		con->current.y != new_state->y;
+}
+
 /**
  * Apply a transaction to the "current" state of the tree.
  */
@@ -838,6 +892,7 @@ static void transaction_apply(struct sway_transaction *transaction) {
 				"(%.1f frames if 60Hz)", transaction, ms, ms / (1000.0f / 60));
 	}
 
+	bool should_start_new_animation = false;
 	// Apply the instruction state to the node's current state
 	for (int i = 0; i < transaction->instructions->length; ++i) {
 		struct sway_transaction_instruction *instruction =
@@ -855,12 +910,31 @@ static void transaction_apply(struct sway_transaction *transaction) {
 					&instruction->workspace_state);
 			break;
 		case N_CONTAINER:
-			apply_container_state(node->sway_container,
-					&instruction->container_state);
+			struct sway_container *con = node->sway_container;
+			if (should_con_new_animation(con, &instruction->container_state)) {
+				should_start_new_animation = true;
+
+				// TODO: reset animation state on going to scratchpad
+				// skip newly spawned windows (for now!)
+				if (con->view && con->current.workspace) {
+					int lx, ly;
+					wlr_scene_node_coords(&con->scene_tree->node, &lx, &ly);
+					con->animation_state.delta_x = lx - con->pending.x;
+					con->animation_state.delta_y = ly - con->pending.y;
+					con->animation_state.delta_width = con->animation_state.current_width - con->pending.width;
+					con->animation_state.delta_height = con->animation_state.current_height - con->pending.height;
+					add_animation(con->animation_state.animation);
+				}
+			}
+			apply_container_state(con, &instruction->container_state);
 			break;
 		}
 
 		node->instruction = NULL;
+	}
+
+	if (should_start_new_animation) {
+		start_animations(&animation_update_callback);
 	}
 }
 

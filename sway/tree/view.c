@@ -1230,8 +1230,6 @@ static void view_save_buffer_iterator(struct wlr_scene_buffer *buffer,
 	wlr_scene_node_set_position(&sbuf->node, sx, sy);
 	wlr_scene_buffer_set_transform(sbuf, buffer->transform);
 	wlr_scene_buffer_set_buffer(sbuf, buffer->buffer);
-
-	// Set effects to saved views
 	wlr_scene_buffer_set_corner_radii(sbuf, buffer->corners);
 }
 
@@ -1246,7 +1244,7 @@ void view_save_buffer(struct sway_view *view) {
 		return;
 	}
 
-	// Enable and disable the saved surface tree like so to atomitaclly update
+	// Enable and disable the saved surface tree like so to atomically update
 	// the tree. This will prevent over damaging or other weirdness.
 	wlr_scene_node_set_enabled(&view->saved_surface_tree->node, false);
 
@@ -1291,3 +1289,4 @@ void view_send_frame_done(struct sway_view *view) {
 		wlr_scene_node_for_each_buffer(node, send_frame_done_iterator, &when);
 	}
 }
+

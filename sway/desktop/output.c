@@ -263,6 +263,14 @@ void output_configure_scene(struct sway_output *output, struct wlr_scene_node *n
 				buffer,
 				has_titlebar ? corner_radii_bottom(buffer_corner_radius) : corner_radii_all(buffer_corner_radius)
 			);
+			
+			if (closest_con) {
+				int content_width = closest_con->animation_state.current_content_width;
+				int content_height = closest_con->animation_state.current_content_height;
+				if (content_width > 0 && content_height > 0) {
+					wlr_scene_buffer_set_dest_size(buffer, content_width, content_height);
+				}
+			}
 		} else if (wlr_subsurface_try_from_wlr_surface(surface->surface)) {
 			wlr_scene_buffer_set_corner_radii(
 				buffer,
